@@ -38,28 +38,49 @@ SUPPORTED_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/we
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
+# 客户端不显示侧边栏及其控制按钮。管理员配置仅由部署平台服务端读取。
+st.markdown("""
+<style>
+[data-testid="stSidebar"],
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"] {display: none !important;}
+.block-container {max-width: 1050px; padding-top: 2rem;}
+</style>
+""", unsafe_allow_html=True)
+
 
 def load_authorized_users(path: str) -> dict[str, date | None]:
-    """读取本地授权码。格式为“码”或“码,YYYY-MM-DD”。"""
+    """优先读取 Streamlit Secrets 中的授权码，然后读取本地授权文件。
+
+    Secrets 中 AUTHORIZED_USERS 可填写多行，每行一个码或“码,YYYY-MM-DD”。
+    """
     users: dict[str, date | None] = {}
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            for line_no, raw in enumerate(f, start=1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
+        configured_codes = st.secrets.get("AUTHORIZED_USERS", "")
+    except Exception:
+        configured_codes = ""
+    try:
+        if configured_codes:
+            source_lines = str(configured_codes).splitlines()
+        else:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                source_lines = f.readlines()
+        for line_no, raw in enumerate(source_lines, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [part.strip() for part in line.split(",", maxsplit=1)]
+            code = parts[0]
+            if not code:
+                continue
+            expiry = None
+            if len(parts) == 2 and parts[1]:
+                try:
+                    expiry = date.fromisoformat(parts[1])
+                except ValueError:
+                    st.warning(f"授权配置第 {line_no} 行的日期格式无效，应为 YYYY-MM-DD；该条已跳过。")
                     continue
-                parts = [part.strip() for part in line.split(",", maxsplit=1)]
-                code = parts[0]
-                if not code:
-                    continue
-                expiry = None
-                if len(parts) == 2 and parts[1]:
-                    try:
-                        expiry = date.fromisoformat(parts[1])
-                    except ValueError:
-                        st.warning(f"授权文件第 {line_no} 行的日期格式无效，应为 YYYY-MM-DD；该条已跳过。")
-                        continue
-                users[code] = expiry
+            users[code] = expiry
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -239,22 +260,12 @@ def dataframe_to_excel(df: pd.DataFrame) -> bytes:
 st.title("📊 图片转 Excel")
 st.caption("上传表格截图或单据图片，AI 识别后即可预览并下载可编辑的 Excel。")
 
-with st.sidebar:
-    st.header("服务设置")
-    env_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    try:
-        env_key = st.secrets.get("DEEPSEEK_API_KEY", env_key)
-    except Exception:
-        # 未配置 secrets.toml 时，部分 Streamlit 版本会抛出专用异常。
-        pass
-    api_key = st.text_input(
-        "DeepSeek API Key", value=env_key, type="password",
-        help="也可通过环境变量 DEEPSEEK_API_KEY 或 Streamlit secrets.toml 预设。密钥仅用于本次服务端请求。",
-    ).strip()
-    model = st.text_input("视觉模型", value=DEFAULT_MODEL, help="默认使用 DeepSeek 官方支持图片输入的 deepseek-flash。")
-    st.divider()
-    demo_enabled = st.toggle("启用演示授权码", value=False, help="演示码为 DEMO-2026；正式运营请保持关闭。")
-    st.caption(f"授权文件：`{AUTH_FILE}`")
+api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+try:
+    api_key = str(st.secrets.get("DEEPSEEK_API_KEY", api_key)).strip()
+except Exception:
+    pass
+demo_enabled = False  # 生产部署时始终关闭演示授权码
 
 if "authorized" not in st.session_state:
     st.session_state.authorized = False
@@ -293,9 +304,11 @@ if st.button("退出授权"):
     st.rerun()
 
 if not api_key:
-    st.warning("请在左侧输入 DeepSeek API Key，或先配置环境变量后再进行图片识别。")
+    st.info("识别服务暂未开放。服务方完成 DeepSeek API 配置并开通额度后，即可开始转换；你可以先验证授权码。")
 
-uploaded = st.file_uploader("上传图片", type=["png", "jpg", "jpeg", "webp", "gif"], help=f"支持 PNG、JPG、WEBP、GIF，单张不超过 {MAX_IMAGE_MB} MB。")
+uploaded = None
+if api_key:
+    uploaded = st.file_uploader("上传图片", type=["png", "jpg", "jpeg", "webp", "gif"], help=f"支持 PNG、JPG、WEBP、GIF，单张不超过 {MAX_IMAGE_MB} MB。")
 if uploaded is not None:
     image_bytes = uploaded.getvalue()
     if len(image_bytes) > MAX_IMAGE_MB * 1024 * 1024:
@@ -313,10 +326,10 @@ if uploaded is not None:
         st.error("无法读取该图片，请确认文件完整且格式正确。")
         st.stop()
 
-    if st.button("✨ 开始识别并生成表格", type="primary", disabled=not bool(api_key)):
+    if st.button("✨ 开始识别并生成表格", type="primary"):
         with st.spinner("正在调用 DeepSeek 视觉模型识别，请稍候…"):
             try:
-                st.session_state.result_df = parse_image_with_deepseek(image_bytes, mime_type, api_key, model.strip() or DEFAULT_MODEL)
+                st.session_state.result_df = parse_image_with_deepseek(image_bytes, mime_type, api_key, DEFAULT_MODEL)
                 st.session_state.source_name = uploaded.name
             except (RuntimeError, ValueError) as exc:
                 st.error(str(exc))
