@@ -2,8 +2,8 @@
 
 授权文件格式（UTF-8，每行一条）：
     授权码
-    授权码,YYYY-MM-DD
-空行及 # 开头的注释行会被忽略。未写到期日的授权码长期有效。
+授权码首次验证时开始计算 30 天，到期信息保存在 authorized_activations.json。
+也兼容“授权码,YYYY-MM-DD”这种固定到期日期格式。
 
 启动：streamlit run app.py
 """
@@ -14,7 +14,7 @@ import base64
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from typing import Any
 
@@ -31,6 +31,8 @@ APP_TITLE = "图片转 Excel"
 API_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-flash"  # DeepSeek 官方视觉模型
 AUTH_FILE = os.environ.get("AUTHORIZED_USERS_FILE", "authorized_users.txt")
+ACTIVATION_FILE = os.environ.get("AUTHORIZED_ACTIVATIONS_FILE", "authorized_activations.json")
+LICENSE_DAYS = 30
 MAX_IMAGE_MB = 20  # 留出 Base64 编码后的空间，避免触及接口请求体限制
 SUPPORTED_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp", "GIF": "image/gif"}
 
@@ -65,21 +67,60 @@ def load_authorized_users(path: str) -> dict[str, date | None]:
     return users
 
 
-def is_authorized(code: str, users: dict[str, date | None], demo_enabled: bool) -> tuple[bool, str]:
-    """校验授权码及到期日。"""
+def load_activations() -> dict[str, str]:
+    """读取首次激活时间记录。"""
+    try:
+        with open(ACTIVATION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        st.error(f"无法读取激活记录 {ACTIVATION_FILE}，请检查文件是否损坏。")
+        return {}
+
+
+def save_activations(activations: dict[str, str]) -> None:
+    """原子保存激活记录，避免中途写入导致文件损坏。"""
+    temp_path = ACTIVATION_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(activations, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, ACTIVATION_FILE)
+
+
+def is_authorized(code: str, users: dict[str, date | None], demo_enabled: bool) -> tuple[bool, str, str | None]:
+    """校验授权码；纯授权码自首次使用起有效 30 天。"""
     entered = code.strip()
     if not entered:
-        return False, "请输入授权码。"
+        return False, "请输入授权码。", None
     if demo_enabled and entered == "DEMO-2026":
-        return True, "演示授权有效（正式运营前请关闭演示码）。"
+        return True, "演示授权有效。", None
     expiry = users.get(entered, "missing")
     if expiry == "missing":
-        return False, "授权码无效，请核对后重试。"
+        return False, "授权码无效，请核对后重试。", None
     if expiry is not None and expiry < date.today():
-        return False, f"授权码已于 {expiry.isoformat()} 到期。"
+        return False, f"授权码已于 {expiry.isoformat()} 到期。", None
+
+    activations = load_activations()
     if expiry is None:
-        return True, "授权有效。"
-    return True, f"授权有效期至 {expiry.isoformat()}。"
+        # 文件中只写码时，以首次使用时间起算 30 天；之后重复登录不重置期限。
+        activated_at = activations.get(entered)
+        if not activated_at:
+            activated_at = datetime.now().isoformat(timespec="seconds")
+            activations[entered] = activated_at
+            try:
+                save_activations(activations)
+            except OSError as exc:
+                return False, f"无法保存授权激活记录：{exc}", None
+        try:
+            ends_at = datetime.fromisoformat(activated_at) + timedelta(days=LICENSE_DAYS)
+        except ValueError:
+            return False, "该授权码的激活记录格式异常，请联系服务提供者。", None
+        if datetime.now() >= ends_at:
+            return False, f"授权码已于 {ends_at:%Y-%m-%d %H:%M} 到期。", None
+        return True, f"授权有效至 {ends_at:%Y-%m-%d %H:%M}。", ends_at.isoformat(timespec="seconds")
+    ends_at = datetime.combine(expiry + timedelta(days=1), datetime.min.time())
+    return True, f"授权有效期至 {expiry.isoformat()}。", ends_at.isoformat(timespec="seconds")
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -212,11 +253,20 @@ with st.sidebar:
     ).strip()
     model = st.text_input("视觉模型", value=DEFAULT_MODEL, help="默认使用 DeepSeek 官方支持图片输入的 deepseek-flash。")
     st.divider()
-    demo_enabled = st.toggle("启用演示授权码", value=True, help="演示码为 DEMO-2026；正式运营建议关闭。")
+    demo_enabled = st.toggle("启用演示授权码", value=False, help="演示码为 DEMO-2026；正式运营请保持关闭。")
     st.caption(f"授权文件：`{AUTH_FILE}`")
 
 if "authorized" not in st.session_state:
     st.session_state.authorized = False
+if st.session_state.authorized and st.session_state.get("auth_expires_at"):
+    try:
+        if datetime.now() >= datetime.fromisoformat(st.session_state.auth_expires_at):
+            st.session_state.authorized = False
+            st.session_state.pop("license_message", None)
+            st.session_state.pop("auth_expires_at", None)
+            st.warning("授权已到期，请重新输入有效授权码。")
+    except ValueError:
+        st.session_state.authorized = False
 
 if not st.session_state.authorized:
     st.subheader("🔐 输入授权码")
@@ -225,21 +275,21 @@ if not st.session_state.authorized:
         license_code = st.text_input("授权码", placeholder="请输入授权码", type="password")
         submitted = st.form_submit_button("验证并进入", type="primary")
     if submitted:
-        ok, message = is_authorized(license_code, load_authorized_users(AUTH_FILE), demo_enabled)
+        ok, message, auth_expires_at = is_authorized(license_code, load_authorized_users(AUTH_FILE), demo_enabled)
         if ok:
             st.session_state.authorized = True
             st.session_state.license_message = message
+            st.session_state.auth_expires_at = auth_expires_at
             st.rerun()
         else:
             st.error(message)
-    if demo_enabled:
-        st.info("试用码：`DEMO-2026`。此码仅供演示，公开部署前请关闭演示授权。")
     st.stop()
 
 st.success(st.session_state.get("license_message", "授权有效。"))
 if st.button("退出授权"):
     st.session_state.authorized = False
     st.session_state.pop("license_message", None)
+    st.session_state.pop("auth_expires_at", None)
     st.rerun()
 
 if not api_key:
