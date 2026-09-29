@@ -43,7 +43,14 @@ st.markdown("""
 <style>
 [data-testid="stSidebar"],
 [data-testid="collapsedControl"],
-[data-testid="stSidebarCollapsedControl"] {display: none !important;}
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+[data-testid="stAppDeployButton"],
+#MainMenu,
+footer,
+header[data-testid="stHeader"] {display: none !important;}
 .block-container {max-width: 1050px; padding-top: 2rem;}
 </style>
 """, unsafe_allow_html=True)
@@ -258,7 +265,7 @@ def dataframe_to_excel(df: pd.DataFrame) -> bytes:
 
 # ------------------------------ 页面界面 ------------------------------
 st.title("📊 图片转 Excel")
-st.caption("上传表格截图或单据图片，AI 识别后即可预览并下载可编辑的 Excel。")
+st.caption("上传表格截图或单据图片，预览并下载可编辑的 Excel。")
 
 api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 try:
